@@ -4,7 +4,7 @@ bl_info = {
     "version": (1, 1, 0),
     "blender": (2, 93, 0),
     "location": "3D Viewport > Toolbar / Esc key. Style: Preferences > Add-ons",
-    "description": "Toolbar tool that remaps viewport navigation. Keymap style is selectable in addon preferences.",
+    "description": "Adds a tool to navigate in viewport with the mouse only.",
     "category": "3D View",
 }
 
@@ -16,6 +16,7 @@ FALLBACK_TOOL_ID = "builtin.select_box"  # used when the previous tool is unknow
 
 _previous_tool = {}   # context mode -> idname of the tool that was active before ours
 _addon_keymaps = []
+_deferred_menu_keymaps = []
 _tool_registered = False
 
 
@@ -30,9 +31,9 @@ KEYMAP_CLASSIC = (
 )
 
 # Style B: RMB is only claimed on a CLICK_DRAG (press + move past the drag
-# threshold). A plain RMB press-release that never crosses that threshold is
-# not consumed here, so Blender's own keymap still sees it and opens the
-# default context menu. Scroll and LMB are left alone entirely (no entries).
+# threshold). The context-menu PRESS bindings must also be deferred to CLICK,
+# otherwise they consume the press before Blender can recognize a drag.
+# Scroll and LMB are left alone entirely (no entries).
 KEYMAP_ORBIT_RMB = (
     ("view3d.rotate", {"type": 'RIGHTMOUSE', "value": 'CLICK_DRAG'}, None),
     ("view3d.move",   {"type": 'MIDDLEMOUSE', "value": 'PRESS'}, None),
@@ -40,20 +41,13 @@ KEYMAP_ORBIT_RMB = (
 
 DESCRIPTIONS = {
     'CLASSIC': (
-        "Navigate with the mouse only\n"
         "LMB drag: Orbit\n"
         "MMB drag: Pan\n"
-        "RMB drag: Zoom\n"
-        "Esc: toggle Escape Navigation"
+        "RMB drag: Zoom"
     ),
     'ORBIT_RMB': (
-        "Navigate with the mouse only\n"
         "RMB drag: Orbit\n"
-        "MMB drag: Pan\n"
-        "RMB click: context menu (default)\n"
-        "Scroll: zoom (default)\n"
-        "LMB: default\n"
-        "Esc: toggle Escape Navigation"
+        "MMB drag: Pan"
     ),
 }
 
@@ -77,6 +71,48 @@ def get_prefs(context=None):
 def get_nav_style(context=None):
     prefs = get_prefs(context)
     return prefs.nav_style if prefs else 'CLASSIC'
+
+
+def _restore_context_menu_keymaps():
+    for kmi, original_value in _deferred_menu_keymaps:
+        try:
+            # Preserve any subsequent manual edits to this binding.
+            if kmi.value == 'CLICK':
+                kmi.value = original_value
+        except ReferenceError:
+            pass  # The user may have replaced the key configuration.
+    _deferred_menu_keymaps.clear()
+
+
+def _sync_context_menu_keymaps():
+    if get_nav_style() != 'ORBIT_RMB':
+        _restore_context_menu_keymaps()
+        return
+
+    kc = bpy.context.window_manager.keyconfigs.user
+    if kc is None:
+        return
+    for km in kc.keymaps:
+        if km.is_modal or km.region_type != 'WINDOW':
+            continue
+        for kmi in km.keymap_items:
+            if (not kmi.active or kmi.type != 'RIGHTMOUSE'
+                    or kmi.value != 'PRESS'
+                    or kmi.any or kmi.shift or kmi.ctrl or kmi.alt or kmi.oskey
+                    or kmi.key_modifier != 'NONE'):
+                continue
+            if kmi.idname not in {'wm.call_menu', 'wm.call_menu_pie', 'wm.call_panel'}:
+                continue
+            if not getattr(kmi.properties, 'name', '').startswith('VIEW3D_'):
+                continue
+            _deferred_menu_keymaps.append((kmi, kmi.value))
+            kmi.value = 'CLICK'
+
+
+def _initialize_context_menu_keymaps():
+    # Blender builds its user keymaps after startup add-ons are registered.
+    _sync_context_menu_keymaps()
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +166,7 @@ class LK_TL_escape_navigation(bpy.types.WorkSpaceTool):
 # ---------------------------------------------------------------------------
 def _on_nav_style_changed(self, context):
     _reregister_tool(context)
+    _sync_context_menu_keymaps()
 
 
 class LK_escape_navigation_preferences(bpy.types.AddonPreferences):
@@ -139,12 +176,12 @@ class LK_escape_navigation_preferences(bpy.types.AddonPreferences):
         name="Navigation Keymap",
         description="Which mouse buttons drive Escape Navigation",
         items=(
-            ('CLASSIC', "LMB Orbit / MMB Pan / RMB Zoom",
-             "Left drag orbits, middle drag pans, right drag zooms"),
-            ('ORBIT_RMB', "RMB Orbit / MMB Pan (RMB click + scroll stay default)",
+            ('ORBIT_RMB', "Mouse Config 1",
              "Right drag orbits, middle drag pans. A plain right click still "
              "opens the context menu, the scroll wheel still zooms, and the "
              "left mouse button is left completely untouched"),
+            ('CLASSIC', "Mouse Config 2",
+             "Left drag orbits, middle drag pans, right drag zooms"),
         ),
         default='CLASSIC',
         update=_on_nav_style_changed,
@@ -161,11 +198,9 @@ class LK_escape_navigation_preferences(bpy.types.AddonPreferences):
         if self.nav_style == 'ORBIT_RMB':
             warn = layout.box()
             warn.label(text="Note", icon='INFO')
-            warn.label(text="RMB click vs. RMB drag is told apart by Blender's drag")
-            warn.label(text="threshold (Preferences > Input > Mouse > Drag Threshold).")
-            warn.label(text="A very small orbit flick under that threshold opens the")
-            warn.label(text="context menu instead of rotating - drag more deliberately,")
-            warn.label(text="or lower the threshold, if that happens.")
+            warn.label(text="Right-click to open the menu; hold and drag to orbit.")
+            warn.label(text="If a short drag opens the menu, lower Drag Threshold in")
+            warn.label(text="Preferences > Input > Mouse.")
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +228,8 @@ def register():
     bpy.utils.register_class(LK_OT_toggle_escape_navigation)
     bpy.utils.register_class(LK_escape_navigation_preferences)
     _reregister_tool()
+    _sync_context_menu_keymaps()
+    bpy.app.timers.register(_initialize_context_menu_keymaps, first_interval=0.1)
 
     kc = bpy.context.window_manager.keyconfigs.addon
     if kc:
@@ -203,6 +240,9 @@ def register():
 
 def unregister():
     global _tool_registered
+    if bpy.app.timers.is_registered(_initialize_context_menu_keymaps):
+        bpy.app.timers.unregister(_initialize_context_menu_keymaps)
+    _restore_context_menu_keymaps()
     for km, kmi in _addon_keymaps:
         km.keymap_items.remove(kmi)
     _addon_keymaps.clear()
